@@ -25,7 +25,7 @@ def seed_everything(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def build_model(inshape, device, resume=None):
+def build_model(inshape, device, resume=None, integration_steps=7):
     # TransMorph.py uses historical top-level imports (layers, networks, mamba).
     # Match the repository's original train_cross.py import convention.
     repo_root = Path(__file__).resolve().parents[2]
@@ -47,12 +47,14 @@ def build_model(inshape, device, resume=None):
         networks_stub.ConvBlock = UnusedVoxelMorphModule
         sys.modules['networks'] = networks_stub
     from TransMorph import CONFIGS, MambaMorph
+    import layers
 
     if any(size % 16 for size in inshape):
         raise ValueError(f'MambaMorph requires every input dimension to be divisible by 16, got {inshape}.')
     config = CONFIGS['MambaMorph']
     config.img_size = tuple(inshape)
     model = MambaMorph(config).to(device)
+    model.integrate = layers.VecInt(config.img_size, integration_steps).to(device)
     if resume:
         checkpoint = torch.load(resume, map_location=device)
         state = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
@@ -75,9 +77,7 @@ class LocalNCC(torch.nn.Module):
         self.eps = eps
 
     def forward(self, fixed, moved, mask=None):
-        filt = torch.ones((1, 1, self.win, self.win, self.win), device=fixed.device, dtype=fixed.dtype)
-        padding = self.win // 2
-        conv = lambda x: F.conv3d(x, filt, padding=padding)
+        conv = self._box_filter
         count = float(self.win ** 3)
         fixed_sum, moved_sum = conv(fixed), conv(moved)
         fixed2_sum, moved2_sum = conv(fixed * fixed), conv(moved * moved)
@@ -88,6 +88,17 @@ class LocalNCC(torch.nn.Module):
         moved_var = moved2_sum - 2 * moved_mean * moved_sum + moved_mean.square() * count
         loss = -(cross.square() / (fixed_var * moved_var + self.eps))
         return masked_mean(loss, mask)
+
+    def _box_filter(self, value):
+        channels = value.shape[1]
+        filt_x = torch.ones((channels, 1, self.win, 1, 1), device=value.device, dtype=value.dtype)
+        filt_y = torch.ones((channels, 1, 1, self.win, 1), device=value.device, dtype=value.dtype)
+        filt_z = torch.ones((channels, 1, 1, 1, self.win), device=value.device, dtype=value.dtype)
+        padding = self.win // 2
+        value = F.conv3d(value, filt_x, padding=(padding, 0, 0), groups=channels)
+        value = F.conv3d(value, filt_y, padding=(0, padding, 0), groups=channels)
+        value = F.conv3d(value, filt_z, padding=(0, 0, padding), groups=channels)
+        return value
 
 
 class GlobalMutualInformation(torch.nn.Module):
